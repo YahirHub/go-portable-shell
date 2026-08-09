@@ -34,7 +34,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the precise language contract and
 ## Install
 
 ```sh
-go get github.com/YahirHub/go-portable-shell@v0.2.0
+go get github.com/YahirHub/go-portable-shell@v0.2.1
 ```
 
 The module requires Go 1.24 or newer.

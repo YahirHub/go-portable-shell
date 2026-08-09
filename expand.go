@@ -369,7 +369,12 @@ func expandTilde(state *shellState, value string) string {
 	if home == "" {
 		return value
 	}
-	return home + strings.TrimPrefix(value, "~")
+	if value == "~" {
+		return home
+	}
+	suffix := strings.TrimLeft(value[1:], `/\`)
+	suffix = strings.ReplaceAll(suffix, `\`, `/`)
+	return filepath.Join(home, filepath.FromSlash(suffix))
 }
 
 func splitFields(state *shellState, value string) []string {
