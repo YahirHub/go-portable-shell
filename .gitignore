@@ -1,0 +1,4 @@
+/coverage.out
+/portablesh.test
+*.prof
+*.tmp

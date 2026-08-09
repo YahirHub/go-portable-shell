@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.24.x', '1.25.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - run: gofmt -d . | tee /tmp/gofmt.diff && test ! -s /tmp/gofmt.diff
+      - run: go test -count=1 ./...
+      - run: go test -race -count=1 ./...
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build ./...
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-windows.test.exe
+      - run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-android.test

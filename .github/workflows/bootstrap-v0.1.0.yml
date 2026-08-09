@@ -1,0 +1,32 @@
+name: Publicar v0.1.0
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'YahirHub/go-portable-shell'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Crear tag y release inicial si faltan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git rev-parse 'refs/tags/v0.1.0' >/dev/null 2>&1; then
+            echo 'v0.1.0 ya existe'
+            exit 0
+          fi
+          git config user.name 'YahirHub'
+          git config user.email '217099863+YahirHub@users.noreply.github.com'
+          git tag -a v0.1.0 -m 'Primera versión estable del shell portable'
+          git push origin v0.1.0
+          gh release create v0.1.0 \
+            --title 'go-portable-shell v0.1.0' \
+            --notes 'Primera versión estable: shell portable en Go puro, sin dependencias y bajo licencia 0BSD.'
