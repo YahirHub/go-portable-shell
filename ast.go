@@ -34,6 +34,14 @@ type forNode struct {
 	words []word
 	body  node
 }
+type caseNode struct {
+	value   word
+	clauses []caseClause
+}
+type caseClause struct {
+	patterns []word
+	body     node
+}
 type groupNode struct {
 	body     node
 	subshell bool
@@ -50,13 +58,17 @@ func (*simpleNode) shellNode()   {}
 func (*ifNode) shellNode()       {}
 func (*whileNode) shellNode()    {}
 func (*forNode) shellNode()      {}
+func (*caseNode) shellNode()     {}
 func (*groupNode) shellNode()    {}
 func (*functionNode) shellNode() {}
 
 type redirect struct {
-	fd     int
-	op     string
-	target word
+	fd           int
+	op           string
+	target       word
+	inline       string
+	stripTabs    bool
+	expandInline bool
 }
 
 type word struct {
@@ -83,6 +95,17 @@ func (w word) plain() (string, bool) {
 	var value string
 	for _, part := range w.parts {
 		if part.kind != partLiteral || part.quoted {
+			return "", false
+		}
+		value += part.value
+	}
+	return value, true
+}
+
+func (w word) literal() (string, bool) {
+	var value string
+	for _, part := range w.parts {
+		if part.kind != partLiteral {
 			return "", false
 		}
 		value += part.value

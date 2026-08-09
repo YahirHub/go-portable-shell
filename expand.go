@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -37,6 +38,7 @@ func (r *Runner) expandWord(ctx context.Context, state *shellState, input word, 
 	fields := []string{""}
 	preserveEmpty := false
 	allowGlob := false
+	allowBrace := false
 	for _, part := range parts {
 		values, multi, err := r.evaluatePart(ctx, state, part, streams)
 		if err != nil {
@@ -58,13 +60,16 @@ func (r *Runner) expandWord(ctx context.Context, state *shellState, input word, 
 		if part.kind == partLiteral || !split {
 			value := first(values)
 			fields[len(fields)-1] += value
+			if part.kind == partLiteral && !part.quoted && strings.ContainsAny(value, "{}") {
+				allowBrace = true
+			}
 			if strings.ContainsAny(value, "*?[") {
 				allowGlob = true
 			}
 			continue
 		}
 		value := first(values)
-		pieces := splitFields(value)
+		pieces := splitFields(state, value)
 		if len(pieces) == 0 {
 			continue
 		}
@@ -77,12 +82,22 @@ func (r *Runner) expandWord(ctx context.Context, state *shellState, input word, 
 	if len(fields) == 1 && fields[0] == "" && !preserveEmpty && len(parts) > 0 && parts[0].kind != partLiteral {
 		return nil, nil
 	}
-	if !glob || !allowGlob {
+	if allowBrace {
+		var err error
+		fields, err = r.expandBraces(ctx, state, fields)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !glob || !allowGlob || state.options.noglob {
 		return fields, nil
 	}
 	var expanded []string
 	for _, field := range fields {
-		matches := globMatches(state.dir, field)
+		matches, err := r.globMatches(ctx, state.dir, field, r.cfg.MaxGlobMatches)
+		if err != nil {
+			return nil, r.observeLimit(err)
+		}
 		if len(matches) == 0 {
 			expanded = append(expanded, field)
 		} else {
@@ -97,14 +112,21 @@ func (r *Runner) evaluatePart(ctx context.Context, state *shellState, part wordP
 	case partLiteral:
 		return []string{part.value}, false, nil
 	case partParameter:
-		return r.expandParameter(ctx, state, part.value, part.quoted, streams)
+		values, multi, err := r.expandParameter(ctx, state, part.value, part.quoted, streams)
+		if err != nil {
+			return nil, false, &ExpansionError{Kind: "parameter", Err: err}
+		}
+		return values, multi, nil
 	case partCommand:
 		value, err := r.commandSubstitution(ctx, state, part.value, streams)
-		return []string{value}, false, err
+		if err != nil {
+			return nil, false, &ExpansionError{Kind: "command substitution", Err: err}
+		}
+		return []string{value}, false, nil
 	case partArithmetic:
 		value, err := evalArithmetic(part.value, state)
 		if err != nil {
-			return nil, false, err
+			return nil, false, &ExpansionError{Kind: "arithmetic", Err: err}
 		}
 		return []string{strconv.FormatInt(value, 10)}, false, nil
 	default:
@@ -117,17 +139,17 @@ func (r *Runner) expandParameter(ctx context.Context, state *shellState, express
 		return append([]string(nil), state.position...), quoted, nil
 	}
 	if expression == "*" {
-		return []string{strings.Join(state.position, " ")}, false, nil
+		return []string{strings.Join(state.position, ifsJoiner(state))}, false, nil
 	}
 	if strings.HasPrefix(expression, "#") && validParameterName(expression[1:]) {
-		value, _, _ := parameterValue(state, expression[1:])
+		value, _, _ := r.parameterValue(state, expression[1:])
 		return []string{strconv.Itoa(len([]rune(value)))}, false, nil
 	}
 	name, op, operand := splitParameterOperator(expression)
 	if !validParameterName(name) {
 		return nil, false, fmt.Errorf("unsupported parameter expansion ${%s}", expression)
 	}
-	value, set, positional := parameterValue(state, name)
+	value, set, positional := r.parameterValue(state, name)
 	if op == "" {
 		if !set && state.options.nounset {
 			return nil, false, fmt.Errorf("%s: unbound variable", name)
@@ -136,6 +158,29 @@ func (r *Runner) expandParameter(ctx context.Context, state *shellState, express
 			return positional, quoted, nil
 		}
 		return []string{value}, false, nil
+	}
+	switch op {
+	case "#", "##", "%", "%%":
+		pattern, err := r.expandOperand(ctx, state, operand, streams)
+		if err != nil {
+			return nil, false, err
+		}
+		return []string{removeParameterPattern(value, pattern, op)}, false, nil
+	case "/", "//":
+		patternSource, replacementSource, _ := strings.Cut(operand, "/")
+		pattern, err := r.expandOperand(ctx, state, patternSource, streams)
+		if err != nil {
+			return nil, false, err
+		}
+		replacement, err := r.expandOperand(ctx, state, replacementSource, streams)
+		if err != nil {
+			return nil, false, err
+		}
+		result, err := replaceParameterPattern(value, pattern, replacement, op == "//")
+		if err != nil {
+			return nil, false, err
+		}
+		return []string{result}, false, nil
 	}
 	colon := strings.HasPrefix(op, ":")
 	testUnset := !set || colon && value == ""
@@ -161,7 +206,9 @@ func (r *Runner) expandParameter(ctx context.Context, state *shellState, express
 			if err != nil {
 				return nil, false, err
 			}
-			state.env[name] = result
+			if err := assignVariable(state, name, result); err != nil {
+				return nil, false, err
+			}
 			value = result
 		}
 	case "?":
@@ -223,6 +270,52 @@ func (r *Runner) commandSubstitution(ctx context.Context, state *shellState, sou
 	return strings.TrimRight(buffer.String(), "\n"), nil
 }
 
+func (r *Runner) expandHeredoc(ctx context.Context, state *shellState, source string, ioStreams streams) (string, error) {
+	var result strings.Builder
+	for offset := 0; offset < len(source); {
+		switch source[offset] {
+		case '\\':
+			if offset+1 < len(source) && strings.ContainsRune("$`\\\n", rune(source[offset+1])) {
+				if source[offset+1] != '\n' {
+					result.WriteByte(source[offset+1])
+				}
+				offset += 2
+				continue
+			}
+			result.WriteByte(source[offset])
+			offset++
+		case '$':
+			fragment := &lexer{source: source[offset:], line: 1, column: 1}
+			part, err := fragment.takeExpansion(true)
+			if err != nil {
+				return "", err
+			}
+			values, _, err := r.evaluatePart(ctx, state, part, ioStreams)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(first(values))
+			offset += fragment.offset
+		case '`':
+			fragment := &lexer{source: source[offset:], line: 1, column: 1}
+			value, err := fragment.takeBacktick()
+			if err != nil {
+				return "", err
+			}
+			expanded, err := r.commandSubstitution(ctx, state, value, ioStreams)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(expanded)
+			offset += fragment.offset
+		default:
+			result.WriteByte(source[offset])
+			offset++
+		}
+	}
+	return result.String(), nil
+}
+
 type limitedBuffer struct {
 	builder  strings.Builder
 	limit    int64
@@ -279,22 +372,36 @@ func expandTilde(state *shellState, value string) string {
 	return home + strings.TrimPrefix(value, "~")
 }
 
-func splitFields(value string) []string {
-	return strings.FieldsFunc(value, func(r rune) bool { return unicode.IsSpace(r) })
+func splitFields(state *shellState, value string) []string {
+	ifs, set := state.env["IFS"]
+	if !set {
+		return strings.FieldsFunc(value, func(r rune) bool { return unicode.IsSpace(r) })
+	}
+	if ifs == "" {
+		return []string{value}
+	}
+	return strings.FieldsFunc(value, func(r rune) bool { return strings.ContainsRune(ifs, r) })
 }
 
-func globMatches(dir, pattern string) []string {
+func (r *Runner) globMatches(ctx context.Context, dir, pattern string, limit int) ([]string, error) {
 	full := pattern
 	relative := !filepath.IsAbs(pattern)
 	if relative {
 		full = filepath.Join(dir, pattern)
 	}
-	matches, err := filepath.Glob(full)
+	matches, err := r.cfg.FileSystem.Glob(full)
 	if err != nil || len(matches) == 0 {
-		return nil
+		return nil, nil
 	}
+	if limit >= 0 && len(matches) > limit {
+		return nil, &ResourceLimitError{Resource: "glob_matches", Limit: int64(limit)}
+	}
+	sort.Strings(matches)
 	result := make([]string, 0, len(matches))
 	for _, match := range matches {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if globExposesHidden(pattern, match, dir, relative) {
 			continue
 		}
@@ -307,7 +414,7 @@ func globMatches(dir, pattern string) []string {
 		}
 		result = append(result, match)
 	}
-	return result
+	return result, nil
 }
 
 func globExposesHidden(pattern, match, dir string, relative bool) bool {
@@ -334,7 +441,7 @@ func globExposesHidden(pattern, match, dir string, relative bool) bool {
 	return false
 }
 
-func parameterValue(state *shellState, name string) (string, bool, []string) {
+func (r *Runner) parameterValue(state *shellState, name string) (string, bool, []string) {
 	switch name {
 	case "?":
 		return strconv.Itoa(state.last), true, nil
@@ -345,18 +452,29 @@ func parameterValue(state *shellState, name string) (string, bool, []string) {
 	case "@":
 		return strings.Join(state.position, " "), true, append([]string(nil), state.position...)
 	case "*":
-		return strings.Join(state.position, " "), true, nil
+		return strings.Join(state.position, ifsJoiner(state)), true, nil
 	case "-":
 		var options string
+		if state.options.errexit {
+			options += "e"
+		}
+		if state.options.noglob {
+			options += "f"
+		}
 		if state.options.nounset {
 			options += "u"
 		}
+		if state.options.xtrace {
+			options += "x"
+		}
 		return options, true, nil
+	case "_":
+		return state.lastArg, state.lastArg != "", nil
 	}
 	if len(name) == 1 && name[0] >= '0' && name[0] <= '9' {
 		index := int(name[0] - '1')
 		if name == "0" {
-			return "portablesh", true, nil
+			return r.cfg.Name, true, nil
 		}
 		if index >= 0 && index < len(state.position) {
 			return state.position[index], true, nil
@@ -367,14 +485,30 @@ func parameterValue(state *shellState, name string) (string, bool, []string) {
 	return value, ok, nil
 }
 
+func ifsJoiner(state *shellState) string {
+	ifs, set := state.env["IFS"]
+	if !set || ifs == "" {
+		return " "
+	}
+	return string([]rune(ifs)[0])
+}
+
 func splitParameterOperator(expression string) (name, operator, operand string) {
-	for i := 1; i < len(expression); i++ {
-		if strings.ContainsRune("-+=?", rune(expression[i])) {
-			start := i
-			if i > 0 && expression[i-1] == ':' {
-				start = i - 1
-			}
-			return expression[:start], expression[start : i+1], expression[i+1:]
+	nameEnd := 0
+	if len(expression) > 0 && strings.ContainsRune("?$#!*@-0123456789", rune(expression[0])) {
+		nameEnd = 1
+	} else {
+		for nameEnd < len(expression) && isNameContinue(expression[nameEnd]) {
+			nameEnd++
+		}
+	}
+	if nameEnd == 0 || nameEnd == len(expression) {
+		return expression, "", ""
+	}
+	rest := expression[nameEnd:]
+	for _, candidate := range []string{":-", ":+", ":=", ":?", "##", "%%", "//", "-", "+", "=", "?", "#", "%", "/"} {
+		if strings.HasPrefix(rest, candidate) {
+			return expression[:nameEnd], candidate, rest[len(candidate):]
 		}
 	}
 	return expression, "", ""

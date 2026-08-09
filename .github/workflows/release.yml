@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'YahirHub/go-portable-shell'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Validate release source
+        env:
+          GOWORK: 'off'
+        run: |
+          go test -count=1 ./...
+          go test -race -count=1 ./...
+          go vet ./...
+          CGO_ENABLED=0 go build ./...
+      - name: Verify tag matches library version
+        shell: bash
+        run: |
+          expected="v$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' version.go)"
+          test "$GITHUB_REF_NAME" = "$expected"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "go-portable-shell $GITHUB_REF_NAME"

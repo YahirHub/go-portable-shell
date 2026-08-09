@@ -39,6 +39,16 @@ func init() {
 		"exit":     builtinExit,
 		"type":     builtinType,
 		"command":  builtinCommand,
+		".":        builtinSource,
+		"source":   builtinSource,
+		"local":    builtinLocal,
+		"readonly": builtinReadonly,
+		"trap":     builtinTrap,
+		"getopts":  builtinGetopts,
+		"umask":    builtinUmask,
+		"exec":     builtinExec,
+		"hash":     builtinHash,
+		"times":    builtinTimes,
 	}
 }
 
@@ -208,10 +218,16 @@ func builtinPwd(_ context.Context, _ *Runner, state *shellState, args []string, 
 	return builtinIO(err)
 }
 
-func builtinCD(_ context.Context, _ *Runner, state *shellState, args []string, ioStreams streams) flowResult {
+func builtinCD(_ context.Context, runner *Runner, state *shellState, args []string, ioStreams streams) flowResult {
 	if len(args) > 1 {
 		fmt.Fprintln(ioStreams.err, "cd: too many arguments")
 		return normal(2)
+	}
+	for _, name := range []string{"OLDPWD", "PWD"} {
+		if state.readonly[name] {
+			fmt.Fprintf(ioStreams.err, "cd: %s: readonly variable\n", name)
+			return normal(1)
+		}
 	}
 	target := state.env["HOME"]
 	show := false
@@ -226,15 +242,12 @@ func builtinCD(_ context.Context, _ *Runner, state *shellState, args []string, i
 		fmt.Fprintln(ioStreams.err, "cd: target directory is empty")
 		return normal(1)
 	}
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(state.dir, target)
-	}
-	target, err := filepath.Abs(target)
+	target, err := runner.resolvePath(state, target, false)
 	if err != nil {
 		fmt.Fprintf(ioStreams.err, "cd: %v\n", err)
 		return normal(1)
 	}
-	info, err := os.Stat(target)
+	info, err := runner.cfg.FileSystem.Stat(target)
 	if err != nil || !info.IsDir() {
 		if err == nil {
 			err = fmt.Errorf("not a directory")
@@ -272,7 +285,10 @@ func builtinExport(_ context.Context, _ *Runner, state *shellState, args []strin
 			return normal(2)
 		}
 		if hasValue {
-			state.env[name] = value
+			if err := assignVariable(state, name, value); err != nil {
+				fmt.Fprintf(ioStreams.err, "export: %v\n", err)
+				return normal(1)
+			}
 		}
 		state.exported[name] = true
 	}
@@ -285,15 +301,17 @@ func builtinUnset(_ context.Context, _ *Runner, state *shellState, args []string
 			fmt.Fprintf(ioStreams.err, "unset: invalid name %q\n", name)
 			return normal(2)
 		}
-		delete(state.env, name)
-		delete(state.exported, name)
+		if err := unsetVariable(state, name); err != nil {
+			fmt.Fprintf(ioStreams.err, "unset: %v\n", err)
+			return normal(1)
+		}
 		delete(state.functions, name)
 	}
 	return normal(0)
 }
 
-func builtinTest(_ context.Context, _ *Runner, state *shellState, args []string, ioStreams streams) flowResult {
-	truth, err := evaluateTest(state, args)
+func builtinTest(_ context.Context, runner *Runner, state *shellState, args []string, ioStreams streams) flowResult {
+	truth, err := evaluateTest(runner, state, args)
 	if err != nil {
 		fmt.Fprintf(ioStreams.err, "test: %v\n", err)
 		return normal(2)
@@ -312,12 +330,12 @@ func builtinBracket(ctx context.Context, runner *Runner, state *shellState, args
 	return builtinTest(ctx, runner, state, args[:len(args)-1], ioStreams)
 }
 
-func evaluateTest(state *shellState, args []string) (bool, error) {
+func evaluateTest(runner *Runner, state *shellState, args []string) (bool, error) {
 	if len(args) == 0 {
 		return false, nil
 	}
 	if args[0] == "!" {
-		value, err := evaluateTest(state, args[1:])
+		value, err := evaluateTest(runner, state, args[1:])
 		return !value, err
 	}
 	if len(args) == 1 {
@@ -334,7 +352,7 @@ func evaluateTest(state *shellState, args []string) (bool, error) {
 			if !filepath.IsAbs(path) {
 				path = filepath.Join(state.dir, path)
 			}
-			info, err := os.Lstat(path)
+			info, err := runner.cfg.FileSystem.Lstat(path)
 			if err != nil {
 				return false, nil
 			}
@@ -350,7 +368,10 @@ func evaluateTest(state *shellState, args []string) (bool, error) {
 			case "-L", "-h":
 				return info.Mode()&os.ModeSymlink != 0, nil
 			case "-r":
-				_, err := os.Open(path)
+				file, err := runner.cfg.FileSystem.Open(path)
+				if err == nil {
+					_ = file.Close()
+				}
 				return err == nil, nil
 			case "-w":
 				return info.Mode().Perm()&0o222 != 0, nil
@@ -418,7 +439,7 @@ func builtinRead(_ context.Context, _ *Runner, state *shellState, args []string,
 	if !raw {
 		line = strings.ReplaceAll(line, `\ `, " ")
 	}
-	fields := strings.Fields(line)
+	fields := splitFields(state, line)
 	for index, name := range names {
 		if !validName(name) {
 			fmt.Fprintf(ioStreams.err, "read: invalid name %q\n", name)
@@ -432,7 +453,10 @@ func builtinRead(_ context.Context, _ *Runner, state *shellState, args []string,
 				value = fields[index]
 			}
 		}
-		state.env[name] = value
+		if err := assignVariable(state, name, value); err != nil {
+			fmt.Fprintf(ioStreams.err, "read: %v\n", err)
+			return normal(1)
+		}
 	}
 	if err != nil {
 		return normal(1)
@@ -461,12 +485,62 @@ func builtinSet(_ context.Context, _ *Runner, state *shellState, args []string, 
 			state.options.nounset = true
 		case "+u":
 			state.options.nounset = false
+		case "-e":
+			state.options.errexit = true
+		case "+e":
+			state.options.errexit = false
+		case "-f":
+			state.options.noglob = true
+		case "+f":
+			state.options.noglob = false
+		case "-x":
+			state.options.xtrace = true
+		case "+x":
+			state.options.xtrace = false
 		case "-o", "+o":
-			if len(args) < 2 || args[1] != "pipefail" {
-				fmt.Fprintln(ioStreams.err, "set: only -o pipefail is supported")
+			if len(args) < 2 {
+				for _, option := range []struct {
+					name    string
+					enabled bool
+				}{
+					{"errexit", state.options.errexit},
+					{"noglob", state.options.noglob},
+					{"nounset", state.options.nounset},
+					{"pipefail", state.options.pipefail},
+					{"xtrace", state.options.xtrace},
+				} {
+					if args[0] == "+o" {
+						prefix := "set +o"
+						if option.enabled {
+							prefix = "set -o"
+						}
+						fmt.Fprintf(ioStreams.out, "%s %s\n", prefix, option.name)
+					} else {
+						status := "off"
+						if option.enabled {
+							status = "on"
+						}
+						fmt.Fprintf(ioStreams.out, "%-12s %s\n", option.name, status)
+					}
+				}
+				return normal(0)
+			}
+			enabled := args[0] == "-o"
+			switch args[1] {
+			case "pipefail":
+				state.options.pipefail = enabled
+			case "errexit":
+				state.options.errexit = enabled
+			case "noglob":
+				state.options.noglob = enabled
+			case "nounset":
+				state.options.nounset = enabled
+			case "xtrace":
+				state.options.xtrace = enabled
+			default:
+				fmt.Fprintf(ioStreams.err, "set: unsupported option %s\n", args[1])
 				return normal(2)
 			}
-			state.options.pipefail = args[0] == "-o"
 			args = args[1:]
 		default:
 			if strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[0], "+") {
@@ -581,11 +655,32 @@ func builtinCommand(ctx context.Context, runner *Runner, state *shellState, args
 		return builtin(ctx, runner, state, args[1:], ioStreams)
 	}
 	request := Command{Args: append([]string(nil), args...), Dir: state.dir, Env: state.environment(), Stdin: ioStreams.in, Stdout: ioStreams.out, Stderr: ioStreams.err}
+	if cached := state.commandHash[args[0]]; cached != "" {
+		request.Path = cached
+	}
+	if runner.cfg.Policy != nil {
+		if err := runner.cfg.Policy.CheckCommand(ctx, request); err != nil {
+			return failure(&PolicyDeniedError{Operation: "command " + args[0], Err: err})
+		}
+	}
 	if runner.cfg.Handler != nil {
 		handled, err := runner.cfg.Handler(ctx, request)
 		if handled || err != nil {
 			return failure(err)
 		}
+	}
+	for _, handler := range runner.cfg.Handlers {
+		if handler == nil {
+			continue
+		}
+		handled, err := handler(ctx, request)
+		if handled || err != nil {
+			return failure(err)
+		}
+	}
+	if runner.cfg.External == ExternalDisabled {
+		fmt.Fprintf(ioStreams.err, "%s: external commands are disabled\n", args[0])
+		return normal(127)
 	}
 	return failure(runExternal(ctx, request))
 }

@@ -1,65 +1,143 @@
 # go-portable-shell
 
-`go-portable-shell` is a small, dependency-free shell interpreter written in
-pure Go. It is designed for applications that need predictable, non-interactive
-shell automation on Windows, Linux, macOS or Android without bundling Bash.
+`go-portable-shell` is a dependency-free interpreter for a bounded,
+non-interactive shell language. It is written in pure Go for applications that
+need predictable automation on Windows, Linux, macOS, or Android without
+shipping Bash.
 
-It intentionally implements a bounded Bash/POSIX-compatible language rather
-than claiming full shell conformance.
+The project deliberately implements a documented Bash/POSIX-compatible subset.
+It does not claim to be a complete POSIX shell, and syntax outside its contract
+fails explicitly.
 
-## Features
+## Highlights
 
-- quoting, escaping, variables and parameter expansion;
-- command substitution with a configurable output limit;
-- sequential lists, `&&`, `||`, `!` and pipelines;
-- `<`, `>`, `>>`, `2>`, `2>>` and descriptor duplication;
-- `if`, `while`, `until`, `for`, groups, subshells and functions;
-- filesystem globbing and tilde expansion;
-- useful builtins such as `cd`, `printf`, `export`, `test`, `read` and `set`;
-- external processes plus a pluggable command-handler API;
-- typed exit statuses and cooperative context cancellation;
-- Unix process-group cleanup when a context is canceled;
-- bounded expansion depth and command-substitution output;
+- quotes, variables, positional parameters, arithmetic, command substitution,
+  brace expansion, globbing, tilde expansion, and IFS field splitting;
+- lists, `&&`, `||`, `!`, pipelines, `if`, `case`, `while`, `until`, `for`,
+  groups, subshells, and functions;
+- here strings, opt-in bounded heredocs, file redirections, and virtual file
+  descriptors from 0 through 255;
+- useful non-interactive builtins including `source`, `local`, `readonly`,
+  `trap`, `getopts`, `umask`, `exec`, `hash`, and `times`;
+- reusable parsed `Program` values, state snapshots and independent clones;
+- ordered in-process command handlers, authorization policies, structured
+  execution events, and a replaceable shell filesystem;
+- typed syntax, expansion, policy, resource, redirection, and command errors;
+- configurable limits for input, AST size, execution, expansion, open files,
+  recursion, and output;
+- context cancellation with process-tree cleanup on Unix and Windows;
 - no runtime dependencies and no CGO.
 
-Unsupported features such as heredocs, job control, process substitution,
-arrays and Bash-specific extended globbing return syntax errors.
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the precise language contract and
+[SECURITY.md](SECURITY.md) before evaluating untrusted input.
 
-The language is deliberately fail-closed: unsupported options and syntax are
-reported instead of being approximated with a different meaning.
+## Install
 
-## Usage
+```sh
+go get github.com/YahirHub/go-portable-shell@v0.2.0
+```
+
+The module requires Go 1.24 or newer.
+
+## Basic use
 
 ```go
 runner, err := portablesh.New(portablesh.Config{
-    Dir:    projectDir,
-    Env:    os.Environ(),
-    Stdin:  os.Stdin,
-    Stdout: os.Stdout,
-    Stderr: os.Stderr,
+	Name:   "automation",
+	Dir:    projectDir,
+	Env:    os.Environ(),
+	Stdin:  os.Stdin,
+	Stdout: os.Stdout,
+	Stderr: os.Stderr,
 })
 if err != nil {
-    log.Fatal(err)
+	log.Fatal(err)
 }
-if err := runner.Run(ctx, `name=world; printf 'hello %s\n' "$name"`); err != nil {
-    log.Fatal(err)
+
+program, err := portablesh.Parse(`
+	name=${NAME:-world}
+	for item in {1..3}; do printf 'hello %s #%s\n' "$name" "$item"; done
+`)
+if err != nil {
+	log.Fatal(err)
+}
+if err := runner.RunProgram(ctx, program); err != nil {
+	log.Fatal(err)
 }
 ```
 
-Applications can provide `Config.Handler` to implement commands internally.
-The handler runs after shell functions and builtins but before external-command
-resolution. Returning `handled=false` delegates to the operating system.
+`Program` values are immutable and may be reused by independent runners.
+`Runner` retains variables, functions, positional parameters, and its working
+directory between sequential calls. A runner is not safe for concurrent use;
+use `Clone` or create another runner for concurrent sessions.
 
-`Runner` keeps its environment, working directory, functions and positional
-parameters across sequential `Run` calls. A runner is intentionally not safe
-for concurrent use; create one runner per independent shell session.
+## Embedding commands
 
-## Security
+`Config.Handler` and `Config.Handlers` implement application-owned commands.
+Handlers run after shell functions and builtins and before host executable
+resolution. Returning `handled=false` delegates to the next handler or the
+operating system.
 
-This package interprets commands. It is not a sandbox. Callers must apply their
-own authorization and filesystem/process policies before running untrusted
-scripts. Context cancellation and substitution limits are reliability controls,
-not a security boundary.
+```go
+runner, err := portablesh.New(portablesh.Config{
+	Dir:      projectDir,
+	External: portablesh.ExternalDisabled,
+	Handler: func(ctx context.Context, command portablesh.Command) (bool, error) {
+		if command.Args[0] != "app-version" {
+			return false, nil
+		}
+		_, err := fmt.Fprintln(command.Stdout, version)
+		return true, err
+	},
+})
+```
+
+An expanded `Command` includes its directory, exported environment, standard
+streams, and virtual descriptor table. On Unix, host processes can inherit
+descriptors above 2 when the descriptor is backed by `*os.File`. Windows
+rejects that unsupported host-process case explicitly; builtins and handlers
+still support the full virtual table.
+
+## Controlling execution
+
+Use these independent controls according to the trust model of the caller:
+
+- `ExternalDisabled` prevents fallback to host executables.
+- `Policy` authorizes expanded commands and redirections before their effects.
+- `RootDir` restricts shell-owned `cd`, `source`, and redirection paths.
+- `FileSystem` supplies shell-owned file reads, metadata, globbing, and writes.
+- `Observer` receives synchronous command, pipeline, process, and limit events.
+- `Max*` fields bound scripts, ASTs, loops, commands, expansions, files,
+  recursion, pipelines, substitutions, heredocs, and output.
+
+These are composable guardrails, not a security sandbox. External executables
+can access the host directly. For adversarial workloads, combine a strict
+policy with operating-system isolation.
+
+Heredocs are disabled by default to preserve the fail-closed v0.1 behavior.
+Enable them deliberately with `AllowHeredocs: true`; `MaxHeredocBytes` remains
+enforced.
+
+Complete programs are available under [examples](examples).
+
+## Errors and status codes
+
+`Status` recognizes `ExitStatus`, including `CommandNotFoundError` as status
+127. Callers can use `errors.As` with `SyntaxError`, `UnsupportedFeatureError`,
+`ResourceLimitError`, `PolicyDeniedError`, `RedirectionError`, `ExpansionError`,
+and `StateError` for structured handling.
+
+## Development
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+CGO_ENABLED=0 go build ./...
+```
+
+CI also tests Windows and macOS natively, fuzzes parser and quoting boundaries,
+checks coverage, and cross-compiles Windows, macOS, and Android targets.
 
 ## License
 

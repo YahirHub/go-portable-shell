@@ -9,22 +9,81 @@ on:
 permissions:
   contents: read
 
+env:
+  GOWORK: 'off'
+
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Verify dependency-free module
+        run: test "$(go list -m all | wc -l)" -eq 1
+      - name: Test with coverage
+        run: go test -count=1 -coverprofile=coverage.out ./...
+      - name: Enforce coverage floor
+        run: |
+          coverage=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          awk -v coverage="$coverage" 'BEGIN { if (coverage < 68) exit 1 }'
+
+  test:
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         go: ['1.24.x', '1.25.x']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
           cache: true
-      - run: gofmt -d . | tee /tmp/gofmt.diff && test ! -s /tmp/gofmt.diff
       - run: go test -count=1 ./...
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
       - run: go test -race -count=1 ./...
-      - run: go vet ./...
-      - run: CGO_ENABLED=0 go build ./...
-      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-windows.test.exe
-      - run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-android.test
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - run: go test -run=^$ -fuzz=FuzzParserNeverPanics -fuzztime=5s
+      - run: go test -run=^$ -fuzz=FuzzBraceExpansionNeverPanics -fuzztime=5s
+      - run: go test -run=^$ -fuzz=FuzzQuoteProducesOneLiteralArgument -fuzztime=5s
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Static host build
+        run: CGO_ENABLED=0 go build ./...
+      - name: Windows amd64 tests
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-windows.test.exe
+      - name: macOS arm64 tests
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-darwin.test
+      - name: Android arm64 tests
+        run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/portablesh-android.test

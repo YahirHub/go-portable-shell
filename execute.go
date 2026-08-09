@@ -6,16 +6,16 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 )
 
 type streams struct {
-	in  io.Reader
-	out io.Writer
-	err io.Writer
+	in          io.Reader
+	out         io.Writer
+	err         io.Writer
+	descriptors map[int]Descriptor
 }
 
 type flowKind uint8
@@ -29,10 +29,11 @@ const (
 )
 
 type flowResult struct {
-	status int
-	kind   flowKind
-	levels int
-	err    error
+	status    int
+	kind      flowKind
+	levels    int
+	err       error
+	statusErr error
 }
 
 func normal(status int) flowResult { return flowResult{status: normalizeStatus(status)} }
@@ -42,7 +43,7 @@ func failure(err error) flowResult {
 		return normal(0)
 	}
 	if status, ok := Status(err); ok {
-		return normal(status)
+		return flowResult{status: normalizeStatus(status), statusErr: err}
 	}
 	return flowResult{status: 1, err: err}
 }
@@ -58,6 +59,10 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 			result = r.execNode(ctx, state, child, ioStreams)
 			state.last = result.status
 			if result.err != nil || result.kind != flowNone || ctx.Err() != nil {
+				return result
+			}
+			if state.options.errexit && result.status != 0 {
+				result.kind = flowExit
 				return result
 			}
 		}
@@ -81,7 +86,7 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 		return r.execSimple(ctx, state, item, ioStreams)
 	case *ifNode:
 		for _, branch := range item.branches {
-			condition := r.execNode(ctx, state, branch.condition, ioStreams)
+			condition := r.execCondition(ctx, state, branch.condition, ioStreams)
 			if condition.err != nil || condition.kind != flowNone {
 				return condition
 			}
@@ -99,7 +104,7 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 			if err := ctx.Err(); err != nil {
 				return failure(err)
 			}
-			condition := r.execNode(ctx, state, item.condition, ioStreams)
+			condition := r.execCondition(ctx, state, item.condition, ioStreams)
 			if condition.err != nil || condition.kind != flowNone {
 				return condition
 			}
@@ -109,6 +114,9 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 			}
 			if !run {
 				return result
+			}
+			if err := r.consumeLoop(state); err != nil {
+				return failure(err)
 			}
 			result = r.execNode(ctx, state, item.body, ioStreams)
 			switch result.kind {
@@ -146,7 +154,12 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 			if err := ctx.Err(); err != nil {
 				return failure(err)
 			}
-			state.env[item.name] = value
+			if err := r.consumeLoop(state); err != nil {
+				return failure(err)
+			}
+			if err := assignVariable(state, item.name, value); err != nil {
+				return failure(err)
+			}
 			result = r.execNode(ctx, state, item.body, ioStreams)
 			switch result.kind {
 			case flowBreak:
@@ -170,6 +183,24 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 			}
 		}
 		return result
+	case *caseNode:
+		values, err := r.expandWord(ctx, state, item.value, false, false, ioStreams)
+		if err != nil {
+			return failure(err)
+		}
+		value := first(values)
+		for _, clause := range item.clauses {
+			for _, patternWord := range clause.patterns {
+				patterns, err := r.expandWord(ctx, state, patternWord, false, false, ioStreams)
+				if err != nil {
+					return failure(err)
+				}
+				if shellPatternMatch(first(patterns), value) {
+					return r.execNode(ctx, state, clause.body, ioStreams)
+				}
+			}
+		}
+		return normal(0)
 	case *groupNode:
 		if item.subshell {
 			return r.execNode(ctx, state.clone(), item.body, ioStreams)
@@ -183,15 +214,50 @@ func (r *Runner) execNode(ctx context.Context, state *shellState, current node, 
 	}
 }
 
-func (r *Runner) execPipeline(ctx context.Context, state *shellState, pipeline *pipelineNode, ioStreams streams) flowResult {
+func (r *Runner) execCondition(ctx context.Context, state *shellState, current node, ioStreams streams) flowResult {
+	errexit := state.options.errexit
+	state.options.errexit = false
+	result := r.execNode(ctx, state, current, ioStreams)
+	state.options.errexit = errexit
+	return result
+}
+
+func (r *Runner) runTrap(ctx context.Context, state *shellState, name string, ioStreams streams) flowResult {
+	source := state.traps[name]
+	if source == "" || state.inTrap {
+		return normal(state.last)
+	}
+	program, err := Parse(source)
+	if err != nil {
+		return failure(err)
+	}
+	state.inTrap = true
+	result := r.execNode(ctx, state, program.root, ioStreams)
+	state.inTrap = false
+	return result
+}
+
+func (r *Runner) execPipeline(ctx context.Context, state *shellState, pipeline *pipelineNode, ioStreams streams) (result flowResult) {
+	if limitExceeded(int64(len(pipeline.commands)), int64(r.cfg.MaxPipelineCommands)) {
+		return failure(r.limitError("pipeline_commands", int64(r.cfg.MaxPipelineCommands)))
+	}
+	r.emit(Event{Kind: EventPipelineStart, Dir: state.dir})
+	defer func() {
+		reportedErr := result.err
+		if reportedErr == nil {
+			reportedErr = result.statusErr
+		}
+		r.emit(Event{Kind: EventPipelineEnd, Dir: state.dir, Status: result.status, Err: reportedErr})
+	}()
 	if len(pipeline.commands) == 1 {
-		result := r.execNode(ctx, state, pipeline.commands[0], ioStreams)
+		result = r.execNode(ctx, state, pipeline.commands[0], ioStreams)
 		if pipeline.negated && result.err == nil && result.kind == flowNone {
 			if result.status == 0 {
 				result.status = 1
 			} else {
 				result.status = 0
 			}
+			result.statusErr = nil
 		}
 		return result
 	}
@@ -237,26 +303,30 @@ func (r *Runner) execPipeline(ctx context.Context, state *shellState, pipeline *
 			return result
 		}
 	}
-	status := results[len(results)-1].status
+	selected := results[len(results)-1]
 	if state.options.pipefail {
 		for i := len(results) - 1; i >= 0; i-- {
 			if results[i].status != 0 {
-				status = results[i].status
+				selected = results[i]
 				break
 			}
 		}
 	}
 	if pipeline.negated {
-		if status == 0 {
-			status = 1
+		if selected.status == 0 {
+			selected.status = 1
 		} else {
-			status = 0
+			selected.status = 0
 		}
+		selected.statusErr = nil
 	}
-	return normal(status)
+	return selected
 }
 
-func (r *Runner) execSimple(ctx context.Context, state *shellState, command *simpleNode, ioStreams streams) flowResult {
+func (r *Runner) execSimple(ctx context.Context, state *shellState, command *simpleNode, ioStreams streams) (result flowResult) {
+	if err := r.consumeCommand(state); err != nil {
+		return failure(err)
+	}
 	assignments := make(map[string]string)
 	wordIndex := 0
 	for wordIndex < len(command.words) {
@@ -275,6 +345,28 @@ func (r *Runner) execSimple(ctx context.Context, state *shellState, command *sim
 	if err != nil {
 		return failure(err)
 	}
+	for name := range assignments {
+		if state.readonly[name] {
+			return failure(fmt.Errorf("%s: readonly variable", name))
+		}
+	}
+	var policyCommand Command
+	if len(args) > 0 {
+		r.emit(Event{Kind: EventCommandStart, Args: args, Dir: state.dir})
+		defer func() {
+			reportedErr := result.err
+			if reportedErr == nil {
+				reportedErr = result.statusErr
+			}
+			r.emit(Event{Kind: EventCommandFinish, Args: args, Dir: state.dir, Status: result.status, Err: reportedErr})
+		}()
+		policyCommand = commandRequest(state, assignments, args, ioStreams)
+		if r.cfg.Policy != nil {
+			if err := r.cfg.Policy.CheckCommand(ctx, policyCommand); err != nil {
+				return failure(&PolicyDeniedError{Operation: "command " + args[0], Err: err})
+			}
+		}
+	}
 	redirected, closers, err := r.applyRedirects(ctx, state, command.redirs, ioStreams)
 	if err != nil {
 		return failure(err)
@@ -282,17 +374,34 @@ func (r *Runner) execSimple(ctx context.Context, state *shellState, command *sim
 	defer closeAll(closers)
 	if len(args) == 0 {
 		for name, value := range assignments {
-			state.env[name] = value
+			if err := assignVariable(state, name, value); err != nil {
+				return failure(err)
+			}
 		}
 		return normal(0)
 	}
+	if state.options.xtrace {
+		fmt.Fprintln(redirected.err, "+ "+Join(args...))
+	}
+	state.lastArg = args[len(args)-1]
+	policyCommand.Stdin = redirected.in
+	policyCommand.Stdout = redirected.out
+	policyCommand.Stderr = redirected.err
+	policyCommand.Descriptors = copyDescriptors(redirected)
 
 	if function, ok := state.functions[args[0]]; ok {
+		if r.cfg.MaxFunctionDepth >= 0 && state.functionDepth >= r.cfg.MaxFunctionDepth {
+			return failure(r.limitError("function_depth", int64(r.cfg.MaxFunctionDepth)))
+		}
 		restore := overlayAssignments(state, assignments)
 		defer restore()
 		previous := state.position
+		state.functionDepth++
+		state.locals = append(state.locals, make(localFrame))
 		state.position = append([]string(nil), args[1:]...)
 		result := r.execNode(ctx, state, function, redirected)
+		restoreLocalFrame(state)
+		state.functionDepth--
 		state.position = previous
 		if result.kind == flowReturn {
 			result.kind = flowNone
@@ -305,18 +414,9 @@ func (r *Runner) execSimple(ctx context.Context, state *shellState, command *sim
 		return builtin(ctx, r, state, args[1:], redirected)
 	}
 
-	commandState := state.clone()
-	for name, value := range assignments {
-		commandState.env[name] = value
-		commandState.exported[name] = true
-	}
-	request := Command{
-		Args:   append([]string(nil), args...),
-		Dir:    commandState.dir,
-		Env:    commandState.environment(),
-		Stdin:  redirected.in,
-		Stdout: redirected.out,
-		Stderr: redirected.err,
+	request := policyCommand
+	if cached := state.commandHash[args[0]]; cached != "" {
+		request.Path = cached
 	}
 	if r.cfg.Handler != nil {
 		handled, handlerErr := r.cfg.Handler(ctx, request)
@@ -327,13 +427,78 @@ func (r *Runner) execSimple(ctx context.Context, state *shellState, command *sim
 			return failure(handlerErr)
 		}
 	}
-	return failure(runExternal(ctx, request))
+	for _, handler := range r.cfg.Handlers {
+		if handler == nil {
+			continue
+		}
+		handled, handlerErr := handler(ctx, request)
+		if handled {
+			return failure(handlerErr)
+		}
+		if handlerErr != nil {
+			return failure(handlerErr)
+		}
+	}
+	if r.cfg.External == ExternalDisabled {
+		fmt.Fprintf(redirected.err, "%s: external commands are disabled\n", args[0])
+		return normal(127)
+	}
+	r.emit(Event{Kind: EventExternalStart, Args: args, Dir: state.dir, External: true})
+	externalErr := runExternal(ctx, request)
+	status, _ := Status(externalErr)
+	r.emit(Event{Kind: EventExternalEnd, Args: args, Dir: state.dir, External: true, Status: status, Err: externalErr})
+	return failure(externalErr)
+}
+
+func commandRequest(state *shellState, assignments map[string]string, args []string, ioStreams streams) Command {
+	commandState := state.clone()
+	for name, value := range assignments {
+		commandState.env[name] = value
+		commandState.exported[name] = true
+	}
+	return Command{
+		Args: append([]string(nil), args...), Dir: commandState.dir,
+		Env: commandState.environment(), Stdin: ioStreams.in,
+		Stdout: ioStreams.out, Stderr: ioStreams.err,
+		Descriptors: copyDescriptors(ioStreams),
+	}
 }
 
 func (r *Runner) applyRedirects(ctx context.Context, state *shellState, redirs []redirect, original streams) (streams, []io.Closer, error) {
-	result := original
+	result := cloneStreams(original)
 	var closers []io.Closer
 	for _, redir := range redirs {
+		if redir.fd < 0 || redir.fd > 255 {
+			closeAll(closers)
+			return streams{}, nil, &RedirectionError{FD: redir.fd, Operator: redir.op, Err: errors.New("descriptor must be between 0 and 255")}
+		}
+		if redir.op == "<<" || redir.op == "<<-" {
+			if !r.cfg.AllowHeredocs {
+				closeAll(closers)
+				return streams{}, nil, &UnsupportedFeatureError{Feature: "heredoc", Message: "enable Config.AllowHeredocs explicitly"}
+			}
+			inline := redir.inline
+			if redir.expandInline {
+				var err error
+				inline, err = r.expandHeredoc(ctx, state, inline, result)
+				if err != nil {
+					closeAll(closers)
+					return streams{}, nil, err
+				}
+			}
+			if limitExceeded(int64(len(inline)), r.cfg.MaxHeredocBytes) {
+				closeAll(closers)
+				return streams{}, nil, r.limitError("heredoc_bytes", r.cfg.MaxHeredocBytes)
+			}
+			public := Redirection{FD: redir.fd, Operator: redir.op, Target: "<heredoc>", Inline: true}
+			if err := r.checkRedirectionPolicy(ctx, public); err != nil {
+				closeAll(closers)
+				return streams{}, nil, err
+			}
+			result.descriptors[redir.fd] = Descriptor{Reader: strings.NewReader(inline)}
+			result.syncStandardDescriptors()
+			continue
+		}
 		fields, err := r.expandWord(ctx, state, redir.target, false, false, result)
 		if err != nil {
 			closeAll(closers)
@@ -344,98 +509,166 @@ func (r *Runner) applyRedirects(ctx context.Context, state *shellState, redirs [
 			return streams{}, nil, errors.New("redirection target must expand to exactly one path or descriptor")
 		}
 		target := fields[0]
+		if redir.op == "<<<" {
+			public := Redirection{FD: redir.fd, Operator: redir.op, Target: target, Inline: true}
+			if err := r.checkRedirectionPolicy(ctx, public); err != nil {
+				closeAll(closers)
+				return streams{}, nil, err
+			}
+			result.descriptors[redir.fd] = Descriptor{Reader: strings.NewReader(target + "\n")}
+			result.syncStandardDescriptors()
+			continue
+		}
 		if strings.HasSuffix(redir.op, "&") {
+			if err := r.checkRedirectionPolicy(ctx, Redirection{FD: redir.fd, Operator: redir.op, Target: target}); err != nil {
+				closeAll(closers)
+				return streams{}, nil, err
+			}
 			if err := duplicateDescriptor(&result, redir.fd, target); err != nil {
 				closeAll(closers)
 				return streams{}, nil, err
 			}
 			continue
 		}
-		path := target
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(state.dir, path)
+		forCreate := redir.op == ">" || redir.op == ">>" || redir.op == ">|" || redir.op == "<>"
+		path, err := r.resolvePath(state, target, forCreate)
+		if err != nil {
+			closeAll(closers)
+			return streams{}, nil, &RedirectionError{FD: redir.fd, Operator: redir.op, Target: target, Err: err}
 		}
-		var file *os.File
+		if err := r.checkRedirectionPolicy(ctx, Redirection{FD: redir.fd, Operator: redir.op, Target: target, Path: path}); err != nil {
+			closeAll(closers)
+			return streams{}, nil, err
+		}
+		release, acquireErr := r.acquireOpenFile(state)
+		if acquireErr != nil {
+			closeAll(closers)
+			return streams{}, nil, acquireErr
+		}
+		var file File
 		switch redir.op {
-		case ">", ">>":
+		case ">", ">>", ">|":
 			flags := os.O_CREATE | os.O_WRONLY
 			if redir.op == ">>" {
 				flags |= os.O_APPEND
 			} else {
 				flags |= os.O_TRUNC
 			}
-			file, err = os.OpenFile(path, flags, 0o666)
+			file, err = r.cfg.FileSystem.OpenFile(path, flags, 0o666&^state.umask)
 			if err == nil {
-				if redir.fd == 1 {
-					result.out = file
-				} else if redir.fd == 2 {
-					result.err = file
-				} else {
-					err = fmt.Errorf("output descriptor %d is not supported", redir.fd)
-				}
+				result.descriptors[redir.fd] = Descriptor{Writer: file}
+				result.syncStandardDescriptors()
 			}
 		case "<":
-			if redir.fd != 0 {
-				err = fmt.Errorf("input descriptor %d is not supported", redir.fd)
-				break
-			}
-			file, err = os.Open(path)
+			file, err = r.cfg.FileSystem.Open(path)
 			if err == nil {
-				result.in = file
+				result.descriptors[redir.fd] = Descriptor{Reader: file}
+				result.syncStandardDescriptors()
+			}
+		case "<>":
+			file, err = r.cfg.FileSystem.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o666&^state.umask)
+			if err == nil {
+				result.descriptors[redir.fd] = Descriptor{Reader: file, Writer: file}
+				result.syncStandardDescriptors()
 			}
 		default:
 			err = fmt.Errorf("unsupported redirection %s", redir.op)
 		}
 		if err != nil {
+			release()
 			if file != nil {
 				_ = file.Close()
 			}
 			closeAll(closers)
-			return streams{}, nil, fmt.Errorf("redirection %s %s: %w", redir.op, target, err)
+			return streams{}, nil, &RedirectionError{FD: redir.fd, Operator: redir.op, Target: target, Err: err}
 		}
-		closers = append(closers, file)
+		closers = append(closers, releaseCloser{Closer: file, release: release})
 	}
 	return result, closers, nil
 }
 
+func (r *Runner) checkRedirectionPolicy(ctx context.Context, redirect Redirection) error {
+	if r.cfg.Policy == nil {
+		return nil
+	}
+	if err := r.cfg.Policy.CheckRedirection(ctx, redirect); err != nil {
+		return &PolicyDeniedError{Operation: "redirection", Err: err}
+	}
+	return nil
+}
+
+type releaseCloser struct {
+	io.Closer
+	release func()
+}
+
+func (c releaseCloser) Close() error {
+	err := c.Closer.Close()
+	c.release()
+	return err
+}
+
 func duplicateDescriptor(target *streams, fd int, source string) error {
+	if target.descriptors == nil {
+		*target = cloneStreams(*target)
+	}
 	if source == "-" {
-		if fd == 0 {
-			target.in = strings.NewReader("")
-		} else if fd == 1 {
-			target.out = io.Discard
-		} else if fd == 2 {
-			target.err = io.Discard
-		} else {
-			return fmt.Errorf("descriptor %d is not supported", fd)
-		}
+		delete(target.descriptors, fd)
+		target.syncStandardDescriptors()
 		return nil
 	}
 	sourceFD, err := strconv.Atoi(source)
 	if err != nil {
 		return fmt.Errorf("invalid descriptor %q", source)
 	}
-	switch fd {
-	case 0:
-		if sourceFD != 0 {
-			return fmt.Errorf("input can only duplicate descriptor 0")
-		}
-	case 1:
-		if sourceFD == 2 {
-			target.out = target.err
-		} else if sourceFD != 1 {
-			return fmt.Errorf("cannot duplicate descriptor %d to stdout", sourceFD)
-		}
-	case 2:
-		if sourceFD == 1 {
-			target.err = target.out
-		} else if sourceFD != 2 {
-			return fmt.Errorf("cannot duplicate descriptor %d to stderr", sourceFD)
-		}
-	default:
-		return fmt.Errorf("descriptor %d is not supported", fd)
+	descriptor, ok := target.descriptors[sourceFD]
+	if !ok {
+		return fmt.Errorf("descriptor %d is closed", sourceFD)
 	}
+	target.descriptors[fd] = descriptor
+	target.syncStandardDescriptors()
 	return nil
+}
+
+func cloneStreams(source streams) streams {
+	result := source
+	result.descriptors = copyDescriptors(source)
+	return result
+}
+
+func copyDescriptors(source streams) map[int]Descriptor {
+	result := make(map[int]Descriptor, len(source.descriptors)+3)
+	for fd, descriptor := range source.descriptors {
+		result[fd] = descriptor
+	}
+	if source.in != nil {
+		result[0] = Descriptor{Reader: source.in}
+	}
+	if source.out != nil {
+		result[1] = Descriptor{Writer: source.out}
+	}
+	if source.err != nil {
+		result[2] = Descriptor{Writer: source.err}
+	}
+	return result
+}
+
+func (s *streams) syncStandardDescriptors() {
+	if descriptor, ok := s.descriptors[0]; ok && descriptor.Reader != nil {
+		s.in = descriptor.Reader
+	} else {
+		s.in = strings.NewReader("")
+	}
+	if descriptor, ok := s.descriptors[1]; ok && descriptor.Writer != nil {
+		s.out = descriptor.Writer
+	} else {
+		s.out = io.Discard
+	}
+	if descriptor, ok := s.descriptors[2]; ok && descriptor.Writer != nil {
+		s.err = descriptor.Writer
+	} else {
+		s.err = io.Discard
+	}
 }
 
 func overlayAssignments(state *shellState, assignments map[string]string) func() {

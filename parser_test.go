@@ -29,6 +29,16 @@ func TestCommentsAndLineContinuations(t *testing.T) {
 	}
 }
 
+func TestCRLFInputIsNormalized(t *testing.T) {
+	runner, stdout, _ := testRunner(t, t.TempDir(), nil)
+	if err := runner.Run(t.Context(), "value=ok\r\nprintf '%s\\n' \"$value\"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "ok\n" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
 func FuzzParserNeverPanics(f *testing.F) {
 	for _, seed := range []string{
 		"printf '%s\\n' hello",

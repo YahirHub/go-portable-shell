@@ -22,25 +22,31 @@ const (
 	tokenLParen
 	tokenRParen
 	tokenRedirect
+	tokenCaseEnd
 )
 
 type token struct {
-	kind  tokenKind
-	word  word
-	op    string
-	fd    int
-	pos   position
-	label string
+	kind          tokenKind
+	word          word
+	op            string
+	fd            int
+	pos           position
+	label         string
+	heredoc       string
+	stripTabs     bool
+	heredocExpand bool
 }
 
 type lexer struct {
-	source string
-	offset int
-	line   int
-	column int
+	source      string
+	offset      int
+	line        int
+	column      int
+	emitNewline bool
 }
 
 func lex(source string) ([]token, error) {
+	source = strings.ReplaceAll(source, "\r\n", "\n")
 	l := &lexer{source: source, line: 1, column: 1}
 	var tokens []token
 	for {
@@ -56,6 +62,10 @@ func lex(source string) ([]token, error) {
 }
 
 func (l *lexer) next() (token, error) {
+	if l.emitNewline {
+		l.emitNewline = false
+		return token{kind: tokenNewline, pos: l.position(), label: "newline after heredoc"}, nil
+	}
 	for !l.done() {
 		switch l.peek(0) {
 		case ' ', '\t', '\r':
@@ -81,6 +91,9 @@ func (l *lexer) next() (token, error) {
 		for range length {
 			l.take()
 		}
+		if l.peek(0) == '<' && l.peek(1) == '<' && l.peek(2) != '<' {
+			return l.takeHeredocRedirect(pos, fd)
+		}
 		op, err := l.takeRedirect()
 		if err != nil {
 			return token{}, err
@@ -91,7 +104,8 @@ func (l *lexer) next() (token, error) {
 	case ';':
 		l.take()
 		if l.peek(0) == ';' {
-			return token{}, l.syntax(pos, "case terminator ';;' is not supported")
+			l.take()
+			return token{kind: tokenCaseEnd, pos: pos, label: ";;"}, nil
 		}
 		return token{kind: tokenSemicolon, pos: pos, label: ";"}, nil
 	case '&':
@@ -117,11 +131,15 @@ func (l *lexer) next() (token, error) {
 			return token{kind: tokenBang, pos: pos, label: "!"}, nil
 		}
 	case '{':
-		l.take()
-		return token{kind: tokenLBrace, pos: pos, label: "{"}, nil
+		if isWordBoundary(l.peek(1)) {
+			l.take()
+			return token{kind: tokenLBrace, pos: pos, label: "{"}, nil
+		}
 	case '}':
-		l.take()
-		return token{kind: tokenRBrace, pos: pos, label: "}"}, nil
+		if isWordBoundary(l.peek(1)) {
+			l.take()
+			return token{kind: tokenRBrace, pos: pos, label: "}"}, nil
+		}
 	case '(':
 		l.take()
 		return token{kind: tokenLParen, pos: pos, label: "("}, nil
@@ -129,6 +147,9 @@ func (l *lexer) next() (token, error) {
 		l.take()
 		return token{kind: tokenRParen, pos: pos, label: ")"}, nil
 	case '<', '>':
+		if l.peek(0) == '<' && l.peek(1) == '<' && l.peek(2) != '<' {
+			return l.takeHeredocRedirect(pos, 0)
+		}
 		op, err := l.takeRedirect()
 		if err != nil {
 			return token{}, err
@@ -183,6 +204,12 @@ func (l *lexer) takeWord() (word, error) {
 				return word{}, err
 			}
 			w.parts = append(w.parts, part)
+		case '`':
+			value, err := l.takeBacktick()
+			if err != nil {
+				return word{}, err
+			}
+			w.parts = append(w.parts, wordPart{kind: partCommand, value: value})
 		default:
 			l.addLiteral(&w, string(l.take()), false)
 		}
@@ -221,6 +248,13 @@ func (l *lexer) takeDoubleQuoted(w *word) error {
 				return err
 			}
 			w.parts = append(w.parts, part)
+			added = true
+		case '`':
+			value, err := l.takeBacktick()
+			if err != nil {
+				return err
+			}
+			w.parts = append(w.parts, wordPart{kind: partCommand, value: value, quoted: true})
 			added = true
 		default:
 			l.addLiteral(w, string(l.take()), true)
@@ -382,18 +416,119 @@ func (l *lexer) takeArithmetic() (string, error) {
 	return "", fmt.Errorf("unterminated arithmetic expansion")
 }
 
-func (l *lexer) takeRedirect() (string, error) {
+func (l *lexer) takeBacktick() (string, error) {
 	pos := l.position()
+	l.take()
+	var value strings.Builder
+	for !l.done() {
+		c := l.take()
+		if c == '`' {
+			return value.String(), nil
+		}
+		if c == '\\' && !l.done() {
+			next := l.take()
+			if next == '`' || next == '\\' || next == '$' {
+				value.WriteByte(next)
+				continue
+			}
+			value.WriteByte(c)
+			value.WriteByte(next)
+			continue
+		}
+		value.WriteByte(c)
+	}
+	return "", l.syntax(pos, "unterminated backtick command substitution")
+}
+
+func (l *lexer) takeHeredocRedirect(pos position, fd int) (token, error) {
+	l.take()
+	l.take()
+	stripTabs := false
+	if l.peek(0) == '-' {
+		stripTabs = true
+		l.take()
+	}
+	for l.peek(0) == ' ' || l.peek(0) == '\t' {
+		l.take()
+	}
+	if l.done() || l.peek(0) == '\n' {
+		return token{}, l.syntax(pos, "heredoc requires a delimiter")
+	}
+	delimiterWord, err := l.takeWord()
+	if err != nil {
+		return token{}, err
+	}
+	delimiter, ok := delimiterWord.literal()
+	if !ok || delimiter == "" {
+		return token{}, l.syntax(pos, "heredoc delimiter must be a non-empty literal word")
+	}
+	expandBody := true
+	for _, part := range delimiterWord.parts {
+		if part.quoted {
+			expandBody = false
+			break
+		}
+	}
+	for l.peek(0) == ' ' || l.peek(0) == '\t' {
+		l.take()
+	}
+	if l.peek(0) != '\n' {
+		return token{}, l.syntax(pos, "bounded heredoc must be the final redirection on its command line")
+	}
+	l.take()
+	var body strings.Builder
+	for !l.done() {
+		lineStart := l.offset
+		for !l.done() && l.peek(0) != '\n' {
+			l.take()
+		}
+		line := l.source[lineStart:l.offset]
+		compare := line
+		if stripTabs {
+			compare = strings.TrimLeft(compare, "\t")
+		}
+		if compare == delimiter {
+			if !l.done() {
+				l.take()
+			}
+			l.emitNewline = true
+			op := "<<"
+			if stripTabs {
+				op = "<<-"
+			}
+			return token{kind: tokenRedirect, fd: fd, op: op, word: delimiterWord, label: op, pos: pos, heredoc: body.String(), stripTabs: stripTabs, heredocExpand: expandBody}, nil
+		}
+		if stripTabs {
+			line = strings.TrimLeft(line, "\t")
+		}
+		body.WriteString(line)
+		if !l.done() {
+			body.WriteByte('\n')
+			l.take()
+		}
+	}
+	return token{}, l.syntax(pos, fmt.Sprintf("unterminated heredoc; expected %q", delimiter))
+}
+
+func (l *lexer) takeRedirect() (string, error) {
 	first := l.take()
 	op := string(first)
+	if first == '<' && l.peek(0) == '>' {
+		l.take()
+		return "<>", nil
+	}
+	if first == '>' && l.peek(0) == '|' {
+		l.take()
+		return ">|", nil
+	}
 	if l.peek(0) == first {
 		l.take()
 		op += string(first)
 		if op == "<<" {
 			if l.peek(0) == '<' {
-				return "", l.syntax(pos, "here strings are not supported")
+				l.take()
+				return "<<<", nil
 			}
-			return "", l.syntax(pos, "heredocs are not supported")
 		}
 	}
 	if l.peek(0) == '&' {
@@ -409,7 +544,12 @@ func (l *lexer) ioNumber() (int, int, bool) {
 	}
 	value, length := 0, 0
 	for c := l.peek(length); c >= '0' && c <= '9'; c = l.peek(length) {
-		value = value*10 + int(c-'0')
+		if value <= 255 {
+			value = value*10 + int(c-'0')
+			if value > 255 {
+				value = 256
+			}
+		}
 		length++
 	}
 	if next := l.peek(length); next != '<' && next != '>' {
@@ -460,7 +600,7 @@ func (l *lexer) take() byte {
 }
 
 func isWordBoundary(c byte) bool {
-	return c == 0 || unicode.IsSpace(rune(c)) || strings.ContainsRune(";&|{}()<>", rune(c))
+	return c == 0 || unicode.IsSpace(rune(c)) || strings.ContainsRune(";&|()<>", rune(c))
 }
 
 func isNameStart(c byte) bool { return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }

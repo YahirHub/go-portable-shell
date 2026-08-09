@@ -2,12 +2,24 @@ package portablesh
 
 import "fmt"
 
+const maxParserNesting = 256
+
 type parser struct {
 	tokens []token
 	index  int
+	depth  int
 }
 
 func parse(source string) (node, error) {
+	program, err := Parse(source)
+	if err != nil {
+		return nil, err
+	}
+	return program.root, nil
+}
+
+// Parse validates source and returns an immutable reusable program.
+func Parse(source string) (*Program, error) {
 	tokens, err := lex(source)
 	if err != nil {
 		return nil, err
@@ -20,7 +32,9 @@ func parse(source string) (node, error) {
 	if p.current().kind != tokenEOF {
 		return nil, p.unexpected("end of input")
 	}
-	return program, nil
+	result := &Program{source: source, root: program}
+	result.report = inspectProgram(program)
+	return result, nil
 }
 
 func (p *parser) parseList(stopWords map[string]bool, stopKinds ...tokenKind) (node, error) {
@@ -92,6 +106,12 @@ func (p *parser) parsePipeline() (node, error) {
 }
 
 func (p *parser) parseCommand() (node, error) {
+	p.depth++
+	if p.depth > maxParserNesting {
+		p.depth--
+		return nil, &ResourceLimitError{Resource: "parser_nesting", Limit: maxParserNesting}
+	}
+	defer func() { p.depth-- }()
 	tok := p.current()
 	if tok.kind == tokenLBrace {
 		return p.parseGroup(false)
@@ -109,9 +129,11 @@ func (p *parser) parseCommand() (node, error) {
 			return p.parseWhile(true)
 		case "for":
 			return p.parseFor()
+		case "case":
+			return p.parseCase()
 		case "function":
 			return p.parseFunctionKeyword()
-		case "then", "elif", "else", "fi", "do", "done", "in":
+		case "then", "elif", "else", "fi", "do", "done", "in", "esac":
 			return nil, p.errorAt(tok.pos, fmt.Sprintf("unexpected reserved word %q", keyword))
 		}
 	}
@@ -129,6 +151,13 @@ func (p *parser) parseSimple() (node, error) {
 			result.words = append(result.words, p.take().word)
 		case tokenRedirect:
 			redirToken := p.take()
+			if redirToken.op == "<<" || redirToken.op == "<<-" {
+				result.redirs = append(result.redirs, redirect{
+					fd: redirToken.fd, op: redirToken.op, target: redirToken.word,
+					inline: redirToken.heredoc, stripTabs: redirToken.stripTabs, expandInline: redirToken.heredocExpand,
+				})
+				continue
+			}
 			if p.current().kind != tokenWord {
 				return nil, p.errorAt(redirToken.pos, fmt.Sprintf("redirection %s requires a target", redirToken.op))
 			}
@@ -140,6 +169,59 @@ func (p *parser) parseSimple() (node, error) {
 			return result, nil
 		}
 	}
+}
+
+func (p *parser) parseCase() (node, error) {
+	start := p.take()
+	if p.current().kind != tokenWord {
+		return nil, p.errorAt(start.pos, "case requires a value")
+	}
+	result := &caseNode{value: p.take().word}
+	p.skipNewlines()
+	if !p.consumeKeyword("in") {
+		return nil, p.errorAt(start.pos, "case requires in")
+	}
+	p.skipSeparators()
+	for !p.consumeKeyword("esac") {
+		if p.current().kind == tokenEOF {
+			return nil, p.errorAt(start.pos, "unterminated case; expected esac")
+		}
+		clause := caseClause{}
+		if p.current().kind == tokenLParen {
+			p.take()
+		}
+		for {
+			if p.current().kind != tokenWord {
+				return nil, p.unexpected("a case pattern")
+			}
+			clause.patterns = append(clause.patterns, p.take().word)
+			if p.current().kind != tokenPipe {
+				break
+			}
+			p.take()
+		}
+		if p.current().kind != tokenRParen {
+			return nil, p.unexpected(") after case patterns")
+		}
+		p.take()
+		p.skipSeparators()
+		body, err := p.parseList(words("esac"), tokenCaseEnd, tokenEOF)
+		if err != nil {
+			return nil, err
+		}
+		clause.body = body
+		result.clauses = append(result.clauses, clause)
+		if p.current().kind == tokenCaseEnd {
+			p.take()
+			p.skipSeparators()
+			continue
+		}
+		if !p.consumeKeyword("esac") {
+			return nil, p.unexpected(";; or esac")
+		}
+		return result, nil
+	}
+	return result, nil
 }
 
 func (p *parser) parseGroup(subshell bool) (node, error) {

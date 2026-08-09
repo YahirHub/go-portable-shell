@@ -67,20 +67,28 @@ func executableFile(path string, env map[string]string) (string, error) {
 }
 
 func runExternal(ctx context.Context, command Command) error {
-	path, err := LookPath(command.Dir, command.Env, command.Args[0])
+	path := command.Path
+	var err error
+	if path == "" {
+		path, err = LookPath(command.Dir, command.Env, command.Args[0])
+	}
 	if err != nil {
 		fmt.Fprintf(command.Stderr, "%s: command not found\n", command.Args[0])
-		return ExitStatus(127)
+		return &CommandNotFoundError{Name: command.Args[0]}
 	}
-	cmd := exec.CommandContext(ctx, path, command.Args[1:]...)
-	cmd.Args = append([]string{command.Args[0]}, command.Args[1:]...)
+	cmd := newExternalCommand(ctx, path, command.Args, command.Env)
 	cmd.Dir = command.Dir
 	cmd.Env = append([]string(nil), command.Env...)
 	cmd.Stdin = command.Stdin
 	cmd.Stdout = command.Stdout
 	cmd.Stderr = command.Stderr
-	prepareCommand(cmd)
-	err = cmd.Run()
+	extraClosers, err := configureExtraFiles(cmd, command.Descriptors)
+	if err != nil {
+		fmt.Fprintf(command.Stderr, "%s: %v\n", command.Args[0], err)
+		return ExitStatus(126)
+	}
+	defer closeAll(extraClosers)
+	err = runPreparedCommand(ctx, cmd)
 	if err == nil {
 		return nil
 	}
