@@ -2,14 +2,47 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
+  tag:
+    if: github.repository == 'YahirHub/go-portable-shell' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Validate tag source
+        env:
+          GOWORK: 'off'
+        run: |
+          go test -count=1 ./...
+          go test -race -count=1 ./...
+          go vet ./...
+          CGO_ENABLED=0 go build ./...
+      - name: Create version tag when missing
+        run: |
+          version="v$(sed -n 's/^const Version = "\([^"]*\)"$/\1/p' version.go)"
+          test "$version" != 'v'
+          if git rev-parse "refs/tags/$version" >/dev/null 2>&1; then
+            echo "$version already exists"
+            exit 0
+          fi
+          git config user.name 'YahirHub'
+          git config user.email '217099863+YahirHub@users.noreply.github.com'
+          git tag -a "$version" -m "Publicar go-portable-shell $version"
+          git push origin "$version"
+
   release:
-    if: github.repository == 'YahirHub/go-portable-shell'
+    if: github.repository == 'YahirHub/go-portable-shell' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
