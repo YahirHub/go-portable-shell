@@ -621,6 +621,8 @@ func builtinType(_ context.Context, _ *Runner, state *shellState, args []string,
 			fmt.Fprintf(ioStreams.out, "%s is a function\n", name)
 		} else if builtins[name] != nil {
 			fmt.Fprintf(ioStreams.out, "%s is a shell builtin\n", name)
+		} else if portableBuiltins[name] != nil {
+			fmt.Fprintf(ioStreams.out, "%s is a portable shell utility\n", name)
 		} else if path, err := LookPath(state.dir, state.environment(), name); err == nil {
 			fmt.Fprintf(ioStreams.out, "%s is %s\n", name, path)
 		} else {
@@ -640,7 +642,7 @@ func builtinCommand(ctx context.Context, runner *Runner, state *shellState, args
 			return normal(2)
 		}
 		name := args[1]
-		if builtins[name] != nil {
+		if builtins[name] != nil || portableBuiltins[name] != nil {
 			fmt.Fprintln(ioStreams.out, name)
 			return normal(0)
 		}
@@ -678,9 +680,16 @@ func builtinCommand(ctx context.Context, runner *Runner, state *shellState, args
 			return failure(err)
 		}
 	}
+	if utility := portableBuiltins[args[0]]; utility != nil {
+		return utility(ctx, runner, state, args[1:], ioStreams)
+	}
 	if runner.cfg.External == ExternalDisabled {
 		fmt.Fprintf(ioStreams.err, "%s: external commands are disabled\n", args[0])
 		return normal(127)
+	}
+	request, err := runner.prepareExternalRequest(ctx, request)
+	if err != nil {
+		return failure(err)
 	}
 	return failure(runExternal(ctx, request))
 }

@@ -439,14 +439,23 @@ func (r *Runner) execSimple(ctx context.Context, state *shellState, command *sim
 			return failure(handlerErr)
 		}
 	}
+	if utility := portableBuiltins[args[0]]; utility != nil {
+		restore := overlayAssignments(state, assignments)
+		defer restore()
+		return utility(ctx, r, state, args[1:], redirected)
+	}
 	if r.cfg.External == ExternalDisabled {
 		fmt.Fprintf(redirected.err, "%s: external commands are disabled\n", args[0])
 		return normal(127)
 	}
-	r.emit(Event{Kind: EventExternalStart, Args: args, Dir: state.dir, External: true})
+	request, err = r.prepareExternalRequest(ctx, request)
+	if err != nil {
+		return failure(err)
+	}
+	r.emit(Event{Kind: EventExternalStart, Args: request.Args, Dir: state.dir, External: true})
 	externalErr := runExternal(ctx, request)
 	status, _ := Status(externalErr)
-	r.emit(Event{Kind: EventExternalEnd, Args: args, Dir: state.dir, External: true, Status: status, Err: externalErr})
+	r.emit(Event{Kind: EventExternalEnd, Args: request.Args, Dir: state.dir, External: true, Status: status, Err: externalErr})
 	return failure(externalErr)
 }
 
