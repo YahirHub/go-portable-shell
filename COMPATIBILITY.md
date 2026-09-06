@@ -1,7 +1,7 @@
 # Compatibility contract
 
 `go-portable-shell` accepts a stable, bounded subset of shell syntax for
-non-interactive automation. This document describes v0.2.0; behavior not listed
+non-interactive automation. This document describes v0.3.0; behavior not listed
 as supported must not be assumed.
 
 ## Supported syntax
@@ -29,8 +29,17 @@ body expansion; `<<-` strips leading tabs. Heredocs are disabled unless
 `read` `set` `shift` `break` `continue` `return` `exit` `type` `command` `.`
 `source` `local` `readonly` `trap` `getopts` `umask` `exec` `hash` `times`
 
-Builtins implement the options useful to this language subset. Unsupported
-flags fail explicitly instead of silently approximating another shell.
+Portable utilities resolved after application handlers and before host
+executables:
+
+`ls` `mkdir` `rmdir` `rm` `cp` `mv` `touch` `chmod` `cat` `head` `tail` `wc`
+`basename` `dirname` `which` `env` `printenv` `sleep` `uname` `whoami` `find`
+`grep`
+
+These utilities implement documented automation-oriented subsets rather than
+full GNU/BSD command compatibility. Unsupported flags fail explicitly. `grep`
+regexp mode uses Go RE2 syntax. Explicit executable paths bypass portable utility
+resolution.
 
 ## Platform behavior
 
@@ -43,9 +52,27 @@ flags fail explicitly instead of silently approximating another shell.
 | Cancellation cleanup | process group | Job Object |
 | Virtual descriptors 0–255 | builtins/handlers | builtins/handlers |
 | Host descriptors above 2 | `*os.File` descriptors | explicitly unsupported |
+| Basic Linux-style utilities | pure-Go portable utilities | pure-Go portable utilities |
+| `apt` fallback when `apt` is absent | native `apt` on Linux; Homebrew mapping on macOS | bounded mapping to `winget` |
+| Git Bash requirement | no | no |
 
 Shell-owned file operations use `Config.FileSystem`. External programs always
 use the host filesystem.
+
+## Host command translation
+
+Translation is fallback-only: native executable resolution is attempted first.
+The bounded v0.3 mappings are:
+
+- Windows: `apt`/`apt-get` actions `update`, one-package `install`, `upgrade`,
+  one-package `remove`, `search`, `show`, and `list` map to `winget` when
+  available; `python3`, `pip3`, and `xdg-open` have native fallback candidates.
+- macOS: the same bounded `apt` family maps to Homebrew when `apt` is absent;
+  `xdg-open` maps to `open`.
+- Linux/Android: commands keep their native spelling.
+
+Unknown or ambiguous package-manager forms are not guessed. The translated
+command is rechecked by `Policy.CheckCommand` before its external process starts.
 
 ## Deliberately unsupported
 

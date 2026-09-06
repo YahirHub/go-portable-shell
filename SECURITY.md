@@ -28,8 +28,14 @@ by the application.
 - `RootDir` rejects shell-owned paths that escape the configured root and
   resolves existing symlinks where possible. It is a guardrail, not a complete
   filesystem boundary.
-- `FileSystem` controls operations performed by builtins, source loading,
-  globbing, and redirections. Host executables do not use this interface.
+- `FileSystem` controls operations performed by builtins, portable utilities,
+  source loading, globbing, and redirections. Mutating portable utilities use
+  optional filesystem capabilities and fail explicitly when a custom
+  implementation does not provide the required operation. Host executables do
+  not use this interface.
+- host command translation is fallback-only. When translation changes the
+  executable or arguments, `Policy.CheckCommand` is invoked again on the actual
+  translated command before process creation.
 - resource limits reduce accidental or hostile resource exhaustion, but do not
   replace process or container quotas. Parsing also has a fixed nesting ceiling
   so deeply nested groups cannot exhaust the Go call stack.

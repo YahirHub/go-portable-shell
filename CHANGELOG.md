@@ -5,6 +5,28 @@ versioning for its public Go API and documented shell subset.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-06
+
+### Added
+
+- pure-Go portable utilities for common Linux-style automation commands,
+  including filesystem, text inspection, environment, discovery and timing
+  tools;
+- bounded host fallback translation for `apt`/`apt-get`, `python3`, `pip3` and
+  `xdg-open` where a native spelling is unavailable;
+- standalone `cmd/portablesh` adapter supporting `-c`, script files, stdin,
+  syntax checking and version output for CLI shell integration;
+- optional mutation capabilities on `OSFileSystem` used by portable utilities
+  without expanding the required `FileSystem` interface.
+
+### Compatibility
+
+- application `Handler`/`Handlers` retain priority over portable utilities;
+- portable utilities take priority over host executables, removing the need to
+  select Git Bash for common commands on Windows;
+- translated external commands are reauthorized through `Policy` before
+  execution and native executables always take precedence over translation.
+
 ## [0.2.1] - 2026-08-09
 
 ### Fixed
@@ -44,7 +66,8 @@ versioning for its public Go API and documented shell subset.
 - initial bounded shell interpreter, builtins, pipelines, control flow,
   handlers, external processes, cancellation, and platform support.
 
-[Unreleased]: https://github.com/YahirHub/go-portable-shell/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/YahirHub/go-portable-shell/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/YahirHub/go-portable-shell/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/YahirHub/go-portable-shell/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/YahirHub/go-portable-shell/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/YahirHub/go-portable-shell/releases/tag/v0.1.0

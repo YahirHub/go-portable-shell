@@ -30,3 +30,6 @@ comandos Go portables mediante `Config.Handler`.
 - `001-motor-inicial-v0-1-0.md`: primera implementación estable.
 - `002-motor-v0-2-0-seguro-extensible.md`: lenguaje ampliado, controles de
   embedding, límites, portabilidad de procesos y validación reforzada.
+- `003-shell-universal-v0-3-0.md`: utilidades Linux portables, traducción de
+  comandos del host y adaptador ejecutable para usar el motor como shell
+  no interactiva predeterminada de un CLI.

@@ -6,7 +6,8 @@
 // resource limits, snapshots, and explicit external-process controls support
 // embedding in larger applications.
 //
-// The package is intended for portable automation, not as a sandbox or a
-// replacement for a user's native shell. Its exact language contract is
+// The package is intended for portable automation and can serve as the default
+// non-interactive execution shell of a CLI. It is not a sandbox or an
+// interactive terminal/job-control shell. Its exact language contract is
 // documented in COMPATIBILITY.md.
 package portablesh
