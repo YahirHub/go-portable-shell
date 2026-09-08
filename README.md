@@ -11,8 +11,9 @@ fails explicitly.
 
 ## Highlights
 
-- quotes, variables, positional parameters, arithmetic, command substitution,
-  brace expansion, globbing, tilde expansion, and IFS field splitting;
+- UTF-8-safe quotes and literal words, variables, positional parameters,
+  arithmetic, command substitution, brace expansion, globbing, tilde expansion,
+  and IFS field splitting;
 - lists, `&&`, `||`, `!`, pipelines, `if`, `case`, `while`, `until`, `for`,
   groups, subshells, and functions;
 - here strings, opt-in bounded heredocs, file redirections, and virtual file
@@ -41,7 +42,7 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the precise language contract and
 ## Install
 
 ```sh
-go get github.com/YahirHub/go-portable-shell@v0.3.0
+go get github.com/YahirHub/go-portable-shell@v0.3.1
 ```
 
 The module requires Go 1.24 or newer.
@@ -49,7 +50,7 @@ The module requires Go 1.24 or newer.
 To install the standalone shell adapter:
 
 ```sh
-go install github.com/YahirHub/go-portable-shell/cmd/portablesh@v0.3.0
+go install github.com/YahirHub/go-portable-shell/cmd/portablesh@v0.3.1
 ```
 
 The executable is intentionally non-interactive. It supports `-c`, script files,

@@ -54,6 +54,18 @@ func TestVariablesQuotesPipelineAndHandler(t *testing.T) {
 	}
 }
 
+func TestUTF8LiteralsPreserveOriginalBytes(t *testing.T) {
+	runner, stdout, _ := testRunner(t, t.TempDir(), nil)
+	script := `printf '%s|%s|%s\n' café "vinculación áéíóúñ ¿Qué pasó?" 'México'`
+	if err := runner.Run(context.Background(), script); err != nil {
+		t.Fatal(err)
+	}
+	const want = "café|vinculación áéíóúñ ¿Qué pasó?|México\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout=%q want=%q", stdout.String(), want)
+	}
+}
+
 func TestRedirectionAndDescriptorOrdering(t *testing.T) {
 	root := t.TempDir()
 	runner, stdout, _ := testRunner(t, root, nil)

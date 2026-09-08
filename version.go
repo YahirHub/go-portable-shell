@@ -1,4 +1,4 @@
 package portablesh
 
 // Version is the semantic version of this API and language contract.
-const Version = "0.3.0"
+const Version = "0.3.1"

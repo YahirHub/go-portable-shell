@@ -181,7 +181,7 @@ func (l *lexer) takeWord() (word, error) {
 				l.take()
 				continue
 			}
-			l.addLiteral(&w, string(l.take()), true)
+			l.addLiteralByte(&w, l.take(), true)
 		case '\'':
 			pos := l.position()
 			l.take()
@@ -211,7 +211,7 @@ func (l *lexer) takeWord() (word, error) {
 			}
 			w.parts = append(w.parts, wordPart{kind: partCommand, value: value})
 		default:
-			l.addLiteral(&w, string(l.take()), false)
+			l.addLiteralByte(&w, l.take(), false)
 		}
 	}
 	if len(w.parts) == 0 {
@@ -237,7 +237,7 @@ func (l *lexer) takeDoubleQuoted(w *word) error {
 				continue
 			}
 			if strings.ContainsRune(`$\"`, rune(next)) {
-				l.addLiteral(w, string(l.take()), true)
+				l.addLiteralByte(w, l.take(), true)
 			} else {
 				l.addLiteral(w, `\`, true)
 			}
@@ -257,7 +257,7 @@ func (l *lexer) takeDoubleQuoted(w *word) error {
 			w.parts = append(w.parts, wordPart{kind: partCommand, value: value, quoted: true})
 			added = true
 		default:
-			l.addLiteral(w, string(l.take()), true)
+			l.addLiteralByte(w, l.take(), true)
 			added = true
 		}
 	}
@@ -556,6 +556,13 @@ func (l *lexer) ioNumber() (int, int, bool) {
 		return 0, 0, false
 	}
 	return value, length, true
+}
+
+func (l *lexer) addLiteralByte(w *word, value byte, quoted bool) {
+	// The lexer indexes source by byte so UTF-8 sequences remain intact. A
+	// direct string(byte) conversion would encode that byte as a Unicode code
+	// point and corrupt every non-ASCII literal. Preserve the original byte.
+	l.addLiteral(w, string([]byte{value}), quoted)
 }
 
 func (l *lexer) addLiteral(w *word, value string, quoted bool) {

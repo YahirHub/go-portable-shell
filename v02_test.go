@@ -517,7 +517,7 @@ func TestCustomFilesystemGlobResultsAreDeterministic(t *testing.T) {
 }
 
 func TestVersionAndInvalidPublicState(t *testing.T) {
-	if Version != "0.3.0" {
+	if Version != "0.3.1" {
 		t.Fatalf("Version=%q", Version)
 	}
 	runner, _, _ := testRunner(t, t.TempDir(), nil)
